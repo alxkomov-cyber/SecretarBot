@@ -1,3 +1,5 @@
+from flask import Flask
+from threading import Thread
 import os
 import json
 import asyncio
@@ -37,6 +39,20 @@ def create_notion_task(text, category="Inbox"):
     except Exception as e:
         print(f"Ошибка Notion: {e}")
         return False
+
+# --- ФУНКЦИЯ: Пинг сервера (чтобы не спал) ---
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "I am alive"
+
+def run_http():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run_http)
+    t.start()
 
 # --- ФУНКЦИЯ: Обработка голосового ---
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -123,7 +139,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(e)
 
 # --- ЗАПУСК ---
+
 if __name__ == '__main__':
+    keep_alive()  # <--- ДОБАВИЛИ ВОТ ЭТО
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    # ... (дальше ваш старый код)
+    if __name__ == '__main__':
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     
