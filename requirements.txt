@@ -4,3 +4,4 @@ groq
 notion-client
 python-dotenv
 flask
+requests
