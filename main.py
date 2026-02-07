@@ -1,8 +1,9 @@
 import os
 import json
 import asyncio
-import requests # <--- Добавили стандартную библиотеку для запросов
-from datetime import datetime
+import requests
+import time
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
@@ -11,19 +12,12 @@ from notion_client import Client
 from flask import Flask
 from threading import Thread
 
-# --- 1. СЕРВЕРНАЯ ЧАСТЬ ---
+# --- 1. СЕРВЕР ---
 app = Flask('')
-
 @app.route('/')
-def home():
-    return "I am alive"
-
-def run_http():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = Thread(target=run_http)
-    t.start()
+def home(): return "I am alive"
+def run_http(): app.run(host='0.0.0.0', port=8080)
+def keep_alive(): t = Thread(target=run_http); t.start()
 
 # --- 2. НАСТРОЙКИ ---
 load_dotenv()
@@ -35,15 +29,35 @@ NOTION_DB_ID = os.getenv("NOTION_DATABASE_ID")
 groq_client = Groq(api_key=GROQ_API_KEY)
 notion = Client(auth=NOTION_TOKEN)
 
-# --- 3. ФУНКЦИЯ: ЗАПИСЬ В NOTION ---
-def create_notion_task(title, category="Входящие", due_date=None, content_text=None):
+# --- 3. ЧТЕНИЕ NOTION ---
+def get_page_content(page_id):
+    try:
+        blocks = notion.blocks.children.list(block_id=page_id)
+        content = []
+        for block in blocks.get("results"):
+            b_type = block.get("type")
+            if "rich_text" in block.get(b_type, {}):
+                text_list = block[b_type]["rich_text"]
+                text = "".join([t["plain_text"] for t in text_list])
+                if text: content.append(text)
+        return "\n".join(content)
+    except Exception as e:
+        print(f"Read Error: {e}")
+        return ""
+
+# --- 4. ЗАПИСЬ ---
+def create_notion_task(title, category="Входящие", due_date=None, content_text=None, tags=None):
     if not category: category = "Входящие"
+    if not tags: tags = []
     
+    tag_objs = [{"name": t} for t in tags]
+
     new_page = {
         "parent": {"database_id": NOTION_DB_ID},
         "properties": {
             "Задача": {"title": [{"text": {"content": title}}]},
-            "Категория": {"select": {"name": category}}
+            "Категория": {"select": {"name": category}},
+            "Теги": {"multi_select": tag_objs}
         }
     }
     if due_date:
@@ -60,208 +74,199 @@ def create_notion_task(title, category="Входящие", due_date=None, conten
         notion.pages.create(**new_page)
         return True
     except Exception as e:
-        print(f"❌ Ошибка записи: {e}")
+        print(f"Write Error: {e}")
         return False
 
-# --- 4. ФУНКЦИЯ: ПОИСК В NOTION (Через requests) ---
-def search_notion(query_text=None, query_date=None, search_mode="text"):
-    """
-    Используем requests напрямую, чтобы избежать ошибок библиотек.
-    """
-    url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query"
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json"
-    }
+# --- 5. ОБНОВЛЕНИЕ СТАТУСА ---
+def update_notion_status(task_name_query, new_status_key="Done"):
+    search_res = search_notion_advanced(text_query=task_name_query, return_raw=True)
+    if not search_res: return f"🤷‍♂️ Не нашел задачу '{task_name_query}'."
+    
+    page_id = search_res[0]['id']
+    page_title = search_res[0]['title']
+    
+    status_map = {"Done": "Done", "Completed": "Done", "In progress": "In progress", "Not started": "Not started"}
+    final_status = status_map.get(new_status_key, "Done")
 
-    filter_params = {"and": []}
-
-    # Поиск по дате
-    if query_date:
-        if search_mode == "date_due":
-            filter_params["and"].append({
-                "property": "Дата",
-                "date": {"equals": query_date}
-            })
-        elif search_mode == "date_created":
-            # Ищем созданные в этот день (по Notion API)
-            filter_params["and"].append({
-                "property": "Дата создания", # Убедитесь, что в Notion колонка так и называется
-                "date": {"equals": query_date} 
-            })
-
-    # Поиск по тексту
-    if query_text:
-        filter_params["and"].append({
-            "property": "Задача",
-            "rich_text": {"contains": query_text}
-        })
-
-    # Если фильтров нет — пустой список
-    if not filter_params["and"]:
-        return []
+    url = f"https://api.notion.com/v1/pages/{page_id}"
+    headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
+    payload = {"properties": {"Статус": {"status": {"name": final_status}}}}
 
     try:
-        response = requests.post(url, headers=headers, json={"filter": filter_params})
-        
-        if response.status_code != 200:
-            print(f"Ошибка API Notion: {response.text}")
-            return [f"Ошибка Notion: {response.status_code}"]
+        requests.patch(url, headers=headers, json=payload)
+        return f"✅ Задача '**{page_title}**' -> {final_status}."
+    except Exception as e:
+        return f"Update Error: {e}"
 
+# --- 6. ПОИСК (V10) ---
+def search_notion_advanced(text_query=None, created_after=None, created_before=None, due_after=None, due_before=None, return_raw=False):
+    url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query"
+    headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
+
+    and_filters = []
+
+    # Ищем текст в заголовке
+    if text_query:
+        and_filters.append({"property": "Задача", "rich_text": {"contains": text_query}})
+
+    if created_after: and_filters.append({"property": "Дата создания", "created_time": {"on_or_after": created_after}})
+    if created_before: and_filters.append({"property": "Дата создания", "created_time": {"on_or_before": created_before}})
+    if due_after: and_filters.append({"property": "Дата", "date": {"on_or_after": due_after}})
+    if due_before: and_filters.append({"property": "Дата", "date": {"on_or_before": due_before}})
+
+    payload = {}
+    if and_filters: payload["filter"] = {"and": and_filters} if len(and_filters) > 1 else and_filters[0]
+
+    try:
+        response = requests.post(url, headers=headers, json=payload)
         data = response.json()
         results = []
         
         for page in data.get("results", []):
             props = page["properties"]
+            p_id = page['id']
             
-            # Достаем данные (безопасно)
-            title_list = props.get("Задача", {}).get("title", [])
-            title = title_list[0]["plain_text"] if title_list else "Без названия"
+            # Безопасное извлечение с защитой от None
+            title_l = props.get("Задача", {}).get("title", [])
+            title = title_l[0]["plain_text"] if title_l else "Без названия"
             
-            status = props.get("Статус", {}).get("status", {}).get("name", "Нет статуса")
+            status_obj = props.get("Статус", {}).get("status")
+            status = status_obj.get("name") if status_obj else "Unknown"
+            
             cat_obj = props.get("Категория", {}).get("select")
-            category = cat_obj.get("name") if cat_obj else "Без категории"
+            cat = cat_obj.get("name") if cat_obj else "Общее"
             
-            results.append(f"- {title} ({category}, Статус: {status})")
-            
+            date_obj = props.get("Дата", {}).get("date")
+            deadline = date_obj.get("start") if date_obj else None
+
+            results.append({'id': p_id, 'title': title, 'status': status, 'date': deadline})
+
         return results
     except Exception as e:
-        print(f"❌ Ошибка поиска requests: {e}")
-        return [f"Ошибка: {e}"]
+        print(f"Search Error: {e}")
+        return []
 
-# --- 5. ОБРАБОТКА ГОЛОСА ---
+# --- 7. ОБРАБОТКА ГОЛОСА ---
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="🎧 Слушаю...", disable_notification=True)
+    status_msg = await context.bot.send_message(chat_id=update.effective_chat.id, text="🎧...", disable_notification=True)
 
     try:
-        # 1. Транскрибация
         file_id = update.message.voice.file_id
         new_file = await context.bot.get_file(file_id)
         ogg_file_path = f"voice_{file_id}.ogg"
         await new_file.download_to_drive(ogg_file_path)
 
-        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text="✍️ Читаю мысли...")
-        
         with open(ogg_file_path, "rb") as file:
             transcription = groq_client.audio.transcriptions.create(
-                file=(ogg_file_path, file.read()),
-                model="whisper-large-v3",
-                response_format="json",
-                language="ru",
-                temperature=0.0
+                file=(ogg_file_path, file.read()), model="whisper-large-v3", response_format="json", language="ru"
             )
         full_text = transcription.text
-        print(f"Текст: {full_text}")
-
-        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text="🧠 Думаю...")
-
         current_date = datetime.now().strftime("%Y-%m-%d")
-        
-        # --- ОБНОВЛЕННЫЙ ПРОМПТ С КАТЕГОРИЯМИ ---
+
+        # --- MEGA PROMPT V10 (Лечим баги) ---
         system_prompt = f"""
         Сегодня: {current_date}.
-        Ты — управляющий базой данных Notion. 
-        
-        Определи намерение (intent): "save" или "search".
+        Ты — ассистент Notion. Твой ответ — СТРОГО JSON.
 
-        1. intent="save" (Добавить, напомни, идея, нужно сделать):
-           - "category": Выбери СТРОГО из списка: Работа, Личное, Идея, Дневник, Обучение, Покупки, Здоровье.
-             ЕСЛИ есть слова "купить", "заказать", "цена" -> ставь "Покупки".
-             ЕСЛИ не подходит никуда -> ставь "Входящие".
-           - "date": Ставь дату (YYYY-MM-DD) ТОЛЬКО если пользователь явно сказал "завтра", "в пятницу", "7 февраля". Если даты нет -> ставь null.
+        1. INTENT "save":
+           - details: Должен содержать ВЕСЬ текст мысли/задачи. Не удаляй информацию, даже если она есть в тегах!
+           - tags: выдели 3-5 ключевых слов.
+           - date: YYYY-MM-DD ТОЛЬКО если пользователь назвал дату/день недели. Если даты нет -> null. Не выдумывай!
 
-        2. intent="search" (Найди, какие планы, что я записал):
-           - "query_text": что ищем (или null).
-           - "query_date": дата YYYY-MM-DD (или null).
-           - "search_mode": 
-             * "date_due" (планы на будущее, дедлайны).
-             * "date_created" (прошлое, "что я записал вчера").
-             * "text" (поиск по смыслу).
+        2. INTENT "search":
+           - query_text: ГЛАВНОЕ СУЩЕСТВИТЕЛЬНОЕ для поиска в Заголовке.
+             Пример: "Сколько бензина до Казани?" -> query_text="Казань" (а не "бензин").
+             Пример: "Детали про отель" -> query_text="отель" (или название отеля, если было).
+           - need_details: true, если вопрос требует чтения содержимого ("сколько", "как", "детали").
+           - ДАТЫ:
+             "На следующей неделе" -> due_after={current_date} + дни до ПН, due_before={current_date} + дни до ВС.
+             "На этой неделе" -> due_after={current_date}, due_before=конец недели.
 
-        Формат JSON:
-        ВАРИАНТ 1 (SAVE):
-        {{ "intent": "save", "items": [ {{ "summary": "...", "details": "...", "category": "...", "date": "..." }} ] }}
+        3. INTENT "update_status".
 
-        ВАРИАНТ 2 (SEARCH):
-        {{ "intent": "search", "query_text": "...", "query_date": "...", "search_mode": "..." }}
+        JSON FORMAT:
+        {{ "intent": "save", "items": [ {{ "summary": "...", "details": "...", "tags": [...], "category": "...", "date": "..." }} ] }}
+        {{ "intent": "search", "query_text": "...", "created_after": "...", "created_before": "...", "due_after": "...", "due_before": "...", "need_details": true }}
         """
 
         chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": full_text}
-            ],
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": full_text}],
             model="llama-3.3-70b-versatile",
             response_format={"type": "json_object"}
         )
         
-        response_data = json.loads(chat_completion.choices[0].message.content)
-        intent = response_data.get("intent")
+        resp = json.loads(chat_completion.choices[0].message.content)
+        intent = resp.get("intent")
 
-        # --- ЛОГИКА: СОХРАНЕНИЕ ---
         if intent == "save":
-            items = response_data.get("items", [])
-            report = f"📝 **Услышал:** {full_text}\n\n"
-            
+            items = resp.get("items", [])
+            report = f"📝 **Текст:** {full_text}\n\n"
             if items:
                 report += "✅ **Сохранено:**\n"
                 for item in items:
-                    summary = item.get("summary")
-                    details = item.get("details")
-                    cat = item.get("category")
-                    date = item.get("date")
-                    
-                    content_to_save = details if details else ""
-                    
-                    if create_notion_task(summary, cat, date, content_to_save):
-                        date_str = f" 📅 {date}" if date else ""
-                        report += f"— **{summary}** [{cat}]{date_str}\n"
-                    else:
-                        report += f"— ❌ Ошибка API: {summary}\n"
-            else:
-                report += "Не понял, что сохранить."
-            
+                    cat = item.get("category", "Входящие")
+                    if create_notion_task(item.get("summary"), cat, item.get("date"), item.get("details"), item.get("tags")):
+                        tags_str = f" 🏷 {', '.join(item.get('tags', []))}" if item.get('tags') else ""
+                        report += f"— {item.get('summary')} [{cat}]{tags_str}\n"
             await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=report)
 
-        # --- ЛОГИКА: ПОИСК ---
+        elif intent == "update_status":
+            res = update_notion_status(resp.get("target_task"), resp.get("new_status"))
+            await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=res)
+
         elif intent == "search":
-            q_text = response_data.get("query_text")
-            q_date = response_data.get("query_date")
-            s_mode = response_data.get("search_mode", "text")
+            found = search_notion_advanced(
+                text_query=resp.get("query_text"),
+                created_after=resp.get("created_after"),
+                created_before=resp.get("created_before"),
+                due_after=resp.get("due_after"),
+                due_before=resp.get("due_before"),
+                return_raw=True
+            )
 
-            found_rows = search_notion(q_text, q_date, s_mode)
-
-            if found_rows:
-                summary_prompt = f"Пользователь спросил: '{full_text}'. Найденные задачи: {found_rows}. Дай краткий ответ."
-                
-                summary_response = groq_client.chat.completions.create(
-                    messages=[{"role": "user", "content": summary_prompt}],
-                    model="llama-3.3-70b-versatile"
-                )
-                final_answer = summary_response.choices[0].message.content
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=f"🔍 **Результат:**\n\n{final_answer}")
+            if not found:
+                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=f"🔍 Заголовок со словом '{resp.get('query_text')}' не найден.")
             else:
-                await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=f"🔍 **Поиск:**\nНичего не найдено.")
+                if resp.get("need_details", False):
+                    top_page = found[0]
+                    content = get_page_content(top_page['id'])
+                    
+                    answer_prompt = f"""
+                    Пользователь спросил: "{full_text}"
+                    Контекст из заметки "{top_page['title']}":
+                    {content[:5000]}
+                    
+                    Дай точный ответ на вопрос.
+                    """
+                    answer_res = groq_client.chat.completions.create(
+                        messages=[{"role": "user", "content": answer_prompt}],
+                        model="llama-3.3-70b-versatile"
+                    )
+                    final_ans = answer_res.choices[0].message.content
+                    await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=f"📖 **{top_page['title']}**:\n{final_ans}")
+                
+                else:
+                    msg = "🔍 **Найдено:**\n"
+                    for f in found:
+                        d = f['date']
+                        d_str = datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m.%Y") if d else ""
+                        date_icon = f"📅 {d_str}" if d else ""
+                        msg += f"✅ {f['title']} {date_icon}\n"
+                    await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=msg)
 
-        if os.path.exists(ogg_file_path):
-            os.remove(ogg_file_path)
+        if os.path.exists(ogg_file_path): os.remove(ogg_file_path)
 
     except Exception as e:
         await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🔥 Ошибка: {e}")
-        print(f"ERROR: {e}")
+        print(f"ERR: {e}")
 
-# --- 6. ЗАПУСК ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="Бот V6.2 (Requests) готов.")
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="Бот V10 (Final Stable) готов.")
 
 if __name__ == '__main__':
     keep_alive() 
-    
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler('start', start))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    
-    print("Бот V6.2 запущен локально!")
+    print("Бот V10 запущен!")
     application.run_polling()
-
