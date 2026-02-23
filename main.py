@@ -219,8 +219,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
            - due_after / due_before: "На этой/следующей неделе" -> СЕГОДНЯ ... ЧЕРЕЗ 7 ДНЕЙ.
 
         3. intent="search_knowledge" (Знания):
-           - Триггеры: "В каком отеле", "Бюджет".
-           - query_text: ГЛАВНОЕ СУЩЕСТВИТЕЛЬНОЕ (Тимбилдинг, Казань).
+           - Триггеры: "В каком отеле", "Бюджет", "С кем обсудить".
+           - query_text: ОДИН КОРЕНЬ самого редкого/важного слова БЕЗ ОКОНЧАНИЯ. Пиши с маленькой буквы.
+             Примеры: 
+             * Юзер: "проблему отрицательных остатков" -> query_text="отрицательн" (игнорируем "проблему", т.к. слово частое, а "отрицательн" редкое).
+             * Юзер: "поездку в Казань" -> query_text="казан".
+             * Юзер: "купить новые джинсы" -> query_text="джинс".
 
         4. intent="update_status" (Выполнение):
            - target_task: ОДНО КЛЮЧЕВОЕ СЛОВО (молоко).
@@ -321,3 +325,4 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     print("Бот V25 запущен!")
     application.run_polling()
+
