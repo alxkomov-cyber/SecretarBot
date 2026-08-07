@@ -60,28 +60,39 @@ def search_advanced(text_query=None, due_after=None, due_before=None, return_raw
     url = f"https://api.notion.com/v1/databases/{config.NOTION_DB_ID}/query"
     headers = {"Authorization": f"Bearer {config.NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
     
-    and_filters =[]
-    if text_query: and_filters.append({"property": "Задача", "rich_text": {"contains": text_query}})
-    if due_after: and_filters.append({"property": "Дата", "date": {"on_or_after": due_after}})
-    if due_before: and_filters.append({"property": "Дата", "date": {"on_or_before": due_before}})
+    and_filters = []
+    
+    if text_query:
+        # ИСПРАВЛЕНИЕ: Ищем ИЛИ в Заголовке, ИЛИ в Тегах
+        and_filters.append({
+            "or": [
+                {"property": "Задача", "rich_text": {"contains": text_query}},
+                {"property": "Теги", "multi_select": {"contains": text_query}}
+            ]
+        })
+        
+    if due_after: 
+        and_filters.append({"property": "Дата", "date": {"on_or_after": due_after}})
+    if due_before: 
+        and_filters.append({"property": "Дата", "date": {"on_or_before": due_before}})
         
     payload = {"filter": {"and": and_filters}} if and_filters else {}
 
     try:
         r = requests.post(url, headers=headers, json=payload)
         data = r.json()
-        results =[]
+        results = []
         for page in data.get("results", []):
             props = page["properties"]
             title_l = safe_get(props, ["Задача", "title"])
             title = title_l[0]["plain_text"] if title_l else "Без названия"
-            status = safe_get(props,["Статус", "status", "name"]) or "Unknown"
-            date = safe_get(props,["Дата", "date", "start"])
+            status = safe_get(props, ["Статус", "status", "name"]) or "Unknown"
+            date = safe_get(props, ["Дата", "date", "start"])
             results.append({'id': page['id'], 'title': title, 'status': status, 'date': date})
         return results
     except Exception as e:
         print(f"Notion Search Error: {e}")
-        return[]
+        return []
 
 def update_status(task_name_query_or_id, new_status_key="Done", exact_status=False):
     if exact_status:
