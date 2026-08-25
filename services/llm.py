@@ -1,9 +1,23 @@
 import json
+import re
 from groq import Groq
 import config
 import prompts
 
 client = Groq(api_key=config.GROQ_API_KEY)
+MODEL_NAME = "qwen-3.6-27b" # Новая модель
+
+def clean_llm_output(text):
+    """Вырезает теги <think> и очищает Markdown"""
+    if not text: return ""
+    # Вырезаем всё между <think> и </think>
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    text = text.strip()
+    # Убираем форматирование ```json если ИИ его добавил
+    if text.startswith("```json"): text = text[7:]
+    if text.startswith("```"): text = text[3:]
+    if text.endswith("```"): text = text[:-3]
+    return text.strip()
 
 def analyze_text(text):
     """Классифицирует намерение и извлекает данные"""
@@ -15,77 +29,82 @@ def analyze_text(text):
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": text}
             ],
-            model="llama-3.3-70b-versatile",
-            response_format={"type": "json_object"}
+            model=MODEL_NAME,
+            response_format={"type": "json_object"},
+            max_tokens=4096 # Лимит
         )
-        return json.loads(chat_completion.choices[0].message.content)
+        
+        raw_response = chat_completion.choices[0].message.content
+        cleaned_response = clean_llm_output(raw_response)
+        
+        return json.loads(cleaned_response)
     except Exception as e:
         print(f"LLM Error: {e}")
         return {"intent": "error", "error": str(e)}
 
 def summarize_answer(query, context_text, title):
-    """Генерирует ответ на вопрос по найденному тексту (RAG)"""
+    """Генерирует ответ на вопрос по найденному тексту"""
     try:
-        ans_prompt = f"""
-Пользователь задал вопрос: {query}
+        ans_prompt = f"""Пользователь задал вопрос: {query}
 Вот текст найденной заметки '{title}':
 {context_text[:5000]}
 
-Твоя задача: Ответь на вопрос пользователя, используя только информацию из этой заметки. 
-
-ПРАВИЛА ФОРМАТИРОВАНИЯ:
-1. Начни с короткого естественного предложения (например: "В магазине 'Семья' нужно купить:").
-2. Если в заметке есть перечисление конкретных дел, покупок, шагов или список (даже если он написан через запятую или дефисы) — ОБЯЗАТЕЛЬНО выведи их в виде вертикального чек-листа. 
-3. Каждый пункт чек-листа начинай с новой строки и с эмодзи ✅.
-4. Если списка по смыслу нет (просто описательная информация) — отвечай обычным связным текстом.
+Ответь на вопрос, используя информацию из заметки.
+ВНИМАНИЕ: СТРОГО ЗАПРЕЩЕНО использовать теги <think>, писать свои рассуждения или вводные фразы. Пиши только готовый ответ!
 """
         res = client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "Ты — вежливый и компетентный ассистент."},
+                {"role": "system", "content": "Ты — вежливый ассистент."},
                 {"role": "user", "content": ans_prompt}
             ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.2 # Низкая температура для строгого следования формату
+            model=MODEL_NAME,
+            temperature=0.2,
+            max_tokens=4096
         )
-        return res.choices[0].message.content
+        
+        raw_response = res.choices[0].message.content
+        return clean_llm_output(raw_response)
     except Exception as e:
         return "Ошибка генерации ответа."
 
 def synthesize_knowledge(ideas_json_str):
     """Анализирует список идей и объединяет связанные"""
-    sys_prompt = """Ты — Аналитик Базы Знаний (Data Scientist).
-Твоя задача — найти логические связи между разрозненными заметками и объединить их в общие концепции/статьи.
-1. Ищи заметки, которые говорят об одном проекте или смежных темах (например: обе про 1С, отчеты, доработки, путешествия). Даже если связь косвенная — объединяй!
-2. ИГНОРИРУЙ заметки, которые ни с чем не связаны (например, бытовые покупки).
-3. Для найденной группы напиши емкое Summary (суть объединения).
+    sys_prompt = """Ты — Аналитик Базы Знаний.
+Твоя задача — найти связи между разрозненными заметками и объединить их в статьи.
+Ищи заметки об одном проекте или теме. Одиночные идеи игнорируй.
 
-Входные данные — это JSON. У каждой заметки есть 'id', 'title', 'content'.
+ВНИМАНИЕ: СТРОГО ЗАПРЕЩЕНО выводить свои рассуждения, теги <think> и комментарии. Выведи ТОЛЬКО чистый JSON.
 
 Формат ответа СТРОГО JSON:
 {
   "clusters":[
     {
        "title": "Синтезированный заголовок",
-       "content": "Сводный текст, объединяющий суть...",
+       "content": "Сводный текст...",
        "tags": ["тег1", "тег2"],
-       "source_ids":["СЮДА СТРОГО СКОПИРУЙ ТОЧНЫЕ 'id' ИЗ ВХОДНЫХ ДАННЫХ"]
+       "source_ids":["СТРОГО ТОЧНЫЕ 'id' ИЗ ВХОДНЫХ ДАННЫХ"]
     }
   ]
 }
-Если связей нет вообще, верни {"clusters":[]}.
+Если связей нет, верни {"clusters":[]}.
 """
     try:
-        prompt = f"Проанализируй эти заметки и найди связи:\n{ideas_json_str}"
+        prompt = f"Проанализируй заметки:\n{ideas_json_str}"
         res = client.chat.completions.create(
             messages=[
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": prompt}
             ],
-            model="llama-3.3-70b-versatile",
+            model=MODEL_NAME,
             response_format={"type": "json_object"},
-            temperature=0.2 # Понижаем фантазию, повышаем точность
+            temperature=0.2,
+            max_tokens=4096
         )
-        return json.loads(res.choices[0].message.content)
+        
+        raw_response = res.choices[0].message.content
+        cleaned_response = clean_llm_output(raw_response)
+        
+        return json.loads(cleaned_response)
     except Exception as e:
         print(f"Error synthesize: {e}")
         return {"clusters":[]}
