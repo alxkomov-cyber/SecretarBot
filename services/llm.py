@@ -5,7 +5,7 @@ import config
 import prompts
 
 client = Groq(api_key=config.GROQ_API_KEY)
-MODEL_NAME = "qwen-3.6-27b" # Новая модель
+MODEL_NAME = "qwen/qwen3.6-27b" # Новая модель
 
 def clean_llm_output(text):
     """Вырезает теги <think> и очищает Markdown"""
