@@ -46,4 +46,6 @@ def get_system_prompt():
     {{ "intent": "search_calendar", "due_after": "YYYY-MM-DD", "due_before": "YYYY-MM-DD" }}
     {{ "intent": "search_knowledge", "query_text": "...", "need_details": true }}
     {{ "intent": "update_status", "target_task": "...", "new_status": "Done" }}
+    
+    ВНИМАНИЕ: СТРОГО ЗАПРЕЩЕНО выводить свои рассуждения, теги <think>, комментарии или вводные слова. Выведи ТОЛЬКО валидный JSON!
     """
