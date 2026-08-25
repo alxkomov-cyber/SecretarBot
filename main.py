@@ -19,6 +19,25 @@ def home(): return "I am alive"
 def run_http(): app.run(host='0.0.0.0', port=8080)
 def keep_alive(): t = Thread(target=run_http); t.start()
 
+# Вспомогательная функция для отправки длинных текстов
+async def send_long_message(context, chat_id, text, message_id_to_edit=None, parse_mode='Markdown'):
+    """Умная нарезка сообщений свыше 4000 символов"""
+    max_length = 4000
+    parts = [text[i:i+max_length] for i in range(0, len(text), max_length)]
+    
+    for i, part in enumerate(parts):
+        try:
+            if i == 0 and message_id_to_edit:
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id_to_edit, text=part, parse_mode=parse_mode)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=part, parse_mode=parse_mode)
+        except Exception:
+            # Fallback, если Markdown ломается на стыке нарезки
+            if i == 0 and message_id_to_edit:
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id_to_edit, text=part)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=part)
+
 # --- БЕЗОПАСНОСТЬ ---
 def is_allowed(update: Update):
     """Проверяет, является ли отправитель Хозяином бота"""
